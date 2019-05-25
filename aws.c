@@ -21,6 +21,9 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <sys/sendfile.h>
+#include <libaio.h>
+#include <sys/eventfd.h>
 
 #include "aws.h"
 #include "util.h"
@@ -53,7 +56,15 @@ struct connection {
 
     int fd;
     char path[BUFSIZ];
-
+	int file_size;
+	int ready_dynamic;
+	int dynamic_sending;
+	io_context_t ctx;
+	int efd;
+	struct iocb iocb;
+	struct iocb *piocb;
+	char *data_buffer; /* fd -> sockfd */
+	size_t data_len;
 };
 typedef struct connection conn;
 char request_path[BUFSIZ];
@@ -95,6 +106,13 @@ static struct connection *connection_create(int sockfd)
 	conn->sockfd = sockfd;
 	memset(conn->recv_buffer, 0, BUFSIZ);
 	memset(conn->send_buffer, 0, BUFSIZ);
+	conn->recv_len = 0;
+	conn->send_len = 0;
+	conn->fd = -1;
+	conn->file_size = 0;
+	conn->ready_dynamic = 0;
+	conn->dynamic_sending = 0;
+
 
 	return conn;
 }
@@ -188,6 +206,12 @@ remove_connection:
 	return STATE_CONNECTION_CLOSED;
 }
 
+static int get_filesize(int fd) {
+	struct stat buf;
+	fstat(fd, &buf);
+	return buf.st_size;
+}
+
 /*
  * Send message on socket.
  * Store message in send_buffer in struct connection.
@@ -205,19 +229,83 @@ static enum connection_state send_message(struct connection *conn)
 		goto remove_connection;
 	}
 
-	bytes_sent = send(conn->sockfd, conn->send_buffer, conn->send_len, 0);
-	if (bytes_sent < 0) {		/* error in communication */
-		dlog(LOG_ERR, "Error in communication to %s\n", abuffer);
-		goto remove_connection;
+	if (conn->send_len > 0) {
+		bytes_sent = send(conn->sockfd, conn->send_buffer, conn->send_len, 0);
+
+		if (bytes_sent < 0) {		/* error in communication */
+			dlog(LOG_ERR, "Error in communication to %s\n", abuffer);
+			goto remove_connection;
+		}
+		if (bytes_sent == 0) {		/* connection closed */
+			dlog(LOG_INFO, "Connection closed to %s\n", abuffer);
+			goto remove_connection;
+		}
+
+		conn->send_len -= bytes_sent;
+		strncpy(conn->send_buffer, conn->send_buffer + bytes_sent, conn->send_len);
+
+
+		dlog(LOG_DEBUG, "Sending message to %s\n", abuffer);
+
+		printf("--\n%s--\n", conn->send_buffer);
+
+		if(conn->send_len == 0) {
+			dlog(LOG_DEBUG, "Sent header to %s\n", abuffer);
+		}
+
+		return 0;
 	}
-	if (bytes_sent == 0) {		/* connection closed */
-		dlog(LOG_INFO, "Connection closed to %s\n", abuffer);
-		goto remove_connection;
+	
+	/* Starting to send file */
+	if (conn->fd != -1) {
+		/* Send using sendfile - case 1 */
+		if (strstr(request_path, STATIC) != NULL) {
+			if (conn->file_size != 0) {
+				rc = sendfile(conn->sockfd, conn->fd, NULL, conn->file_size);
+				DIE(rc < 0, "sendfile");
+				conn->file_size -= rc;
+				return 0;
+			} else {
+				dlog(LOG_DEBUG, "Completed STATIC send file to %s\n", abuffer);
+				goto remove_connection;
+			}
+		/* Send using async IO - case 2 */
+		} else if (strstr(request_path, DYNAMIC) != NULL) {
+			if (conn->ready_dynamic == 0 && conn->dynamic_sending == 0) {
+				conn->data_buffer = malloc(conn->file_size);
+				conn->efd = eventfd(0, 0);
+				conn->ready_dynamic = 1;
+				memset(&conn->iocb, 0, sizeof(conn->iocb));
+				io_prep_pread(&conn->iocb, conn->fd, conn->data_buffer, conn->file_size, 0);
+				conn->piocb = &conn->iocb;
+				io_set_eventfd(&conn->iocb, conn->efd);
+				rc = w_epoll_add_ptr_in(epollfd, conn->efd, conn);
+				DIE(rc < 0, "w_epoll_add_ptr_in");
+				rc = io_setup(1, &conn->ctx);
+				DIE(rc < 0, "io_setup");
+				rc = io_submit(conn->ctx, 1, &conn->piocb);
+				DIE(rc < 0, "io_submit");
+				return 0;
+			} else if (conn->ready_dynamic == 0 && conn->dynamic_sending == 1 && conn->file_size > 0) {
+				int total_sent;
+				total_sent = send(conn->sockfd, conn->data_buffer, conn->file_size, 0);
+				dlog(LOG_INFO, "Sending message to %s:\n%s\n", abuffer, conn->data_buffer);
+				conn->file_size -= total_sent;
+				conn->data_buffer += total_sent;
+				return 0;
+			} else if (conn->file_size == 0) {
+				io_destroy(conn->ctx);
+				conn->ctx = 0;
+				close(conn->efd);
+				conn->efd = -1;
+				dlog(LOG_INFO, "Connection closed to %s\n", abuffer);
+				goto remove_connection;
+				
+			}
+		}
+		
 	}
 
-	dlog(LOG_DEBUG, "Sending message to %s\n", abuffer);
-
-	printf("--\n%s--\n", conn->send_buffer);
 
 	/* all done - remove out notification */
 	rc = w_epoll_update_ptr_in(epollfd, conn->sockfd, conn);
@@ -228,6 +316,7 @@ static enum connection_state send_message(struct connection *conn)
 	return STATE_DATA_SENT;
 
 remove_connection:
+
 	rc = w_epoll_remove_ptr(epollfd, conn->sockfd, conn);
 	DIE(rc < 0, "w_epoll_remove_ptr");
 
@@ -262,6 +351,7 @@ static void try_open(struct connection **conn) {
 	} else {
 		sprintf((*conn)->send_buffer, OK_MSG);
 		(*conn)->send_len = strlen(OK_MSG);
+		(*conn)->file_size = get_filesize((*conn)->fd);
 	}
 }
 
@@ -335,13 +425,28 @@ int main(void)
 			if (rev.events & EPOLLIN)
 				handle_new_connection();
 		} else {
-			if (rev.events & EPOLLIN) {
-				dlog(LOG_DEBUG, "New message\n");
-				handle_client_request(rev.data.ptr);
-			}
-			if (rev.events & EPOLLOUT) {
-				dlog(LOG_DEBUG, "Ready to send message\n");
-				send_message(rev.data.ptr);
+			struct connection *conn = rev.data.ptr;
+			if(conn->ready_dynamic == 1) {
+				u_int64_t efd_ops = 0;
+				rc = read(conn->efd, &efd_ops, sizeof(efd_ops));
+				DIE(rc < 0, "read eventfd");
+				if (efd_ops != 0) {
+					rc = w_epoll_remove_ptr(epollfd,
+								conn->efd,
+								conn);
+					conn->ready_dynamic = 0;
+					conn->dynamic_sending = 1;
+					DIE(rc < 0, "w_epoll_remove_ptr");
+				}
+			} else {
+				if (rev.events & EPOLLIN) {
+					dlog(LOG_DEBUG, "New message\n");
+					handle_client_request(rev.data.ptr);
+				}
+				if (rev.events & EPOLLOUT) {
+					dlog(LOG_DEBUG, "Ready to send message\n");
+					send_message(rev.data.ptr);
+				}
 			}
 		}
 	}

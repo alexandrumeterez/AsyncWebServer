@@ -13,6 +13,8 @@ extern "C" {
 
 #define ERR_MSG "HTTP/1.0 404 Not Found\r\n\r\n"
 #define OK_MSG "HTTP/1.0 200 OK\r\n\r\n"
+#define STATIC "static"
+#define DYNAMIC "dynamic"
 
 #define AWS_LISTEN_PORT		8888
 #define AWS_DOCUMENT_ROOT	"./"
